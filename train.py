@@ -1,10 +1,13 @@
 
+from argparse import Namespace
 import os
+from pdb import set_trace as TT
 from tqdm.auto import tqdm
 from opt import config_parser
 
 
 
+from einops import rearrange
 import json, random
 from renderer import *
 from utils import *
@@ -36,17 +39,61 @@ class SimpleSampler:
         return self.ids[self.curr:self.curr+self.batch]
 
 
+class SequentialSampler(SimpleSampler):
+    def nextids(self):
+        self.curr+=self.batch
+        if self.curr + self.batch > self.total:
+            self.ids = torch.arange(self.total)
+            self.curr = 0
+        # HACK for which we need to have loaded rays for lego blender. Get every 12.5th (??) ray to effectively 
+        #   downsample the images from 800x800 to 64x64.
+        ids = self.ids[self.curr:self.curr+int(self.batch * 12.5)]
+        downsample_ids = np.linspace(0, len(ids)-1, 64*64, dtype=np.int)
+        return ids[downsample_ids].long()
+    
+
+
 @torch.no_grad()
 def export_mesh(args):
 
     ckpt = torch.load(args.ckpt, map_location=device)
     kwargs = ckpt['kwargs']
     kwargs.update({'device': device})
+    kwargs.update({
+                #    'snap_to_block_surfaces': args.snap_to_block_surfaces,
+                   'snap_to_block_surfaces': 1,
+                   'impose_block_density': args.impose_block_density,
+                   'full_block_texture': args.full_block_texture,
+                   # Do not generate new dumy block grid (even if saved model also has dummy grid).
+                   'dummy_block_grid': 0})
     tensorf = eval(args.model_name)(**kwargs)
     tensorf.load(ckpt)
 
     alpha,_ = tensorf.getDenseAlpha()
     convert_sdf_samples_to_ply(alpha.cpu(), f'{args.ckpt[:-3]}.ply',bbox=tensorf.aabb.cpu(), level=0.005)
+
+
+@torch.no_grad()
+def export_block_grid(args):
+    ckpt = torch.load(args.ckpt, map_location=device)
+    kwargs = ckpt['kwargs']
+    kwargs.update({'device': device})
+    kwargs.update({'cfg': Namespace(**{
+                #    'snap_to_block_surfaces': args.snap_to_block_surfaces,
+                   'snap_to_block_surfaces': 1,
+                   'impose_block_density': args.impose_block_density,
+                   'full_block_texture': args.full_block_texture,
+                   # Do not generate new dumy block grid (even if saved model also has dummy grid).
+                   'dummy_block_grid': 0})})
+    tensorf = eval(args.model_name)(**kwargs)
+    tensorf.load(ckpt)
+
+    blocks_grid, blocks_alpha_grid = tensorf.get_block_grid()
+
+    blocks_grid = blocks_grid.cpu().numpy()
+    blocks_alpha_grid = blocks_alpha_grid.cpu().numpy()
+    np.savez(f'{args.ckpt[:-3]}_block_grid.npz', blocks_grid=blocks_grid, blocks_alpha_grid=blocks_alpha_grid)
+
 
 
 @torch.no_grad()
@@ -135,7 +182,8 @@ def reconstruction(args):
         tensorf = eval(args.model_name)(aabb, reso_cur, device,
                     density_n_comp=n_lamb_sigma, appearance_n_comp=n_lamb_sh, app_dim=args.data_dim_color, near_far=near_far,
                     shadingMode=args.shadingMode, alphaMask_thres=args.alpha_mask_thre, density_shift=args.density_shift, distance_scale=args.distance_scale,
-                    pos_pe=args.pos_pe, view_pe=args.view_pe, fea_pe=args.fea_pe, featureC=args.featureC, step_ratio=args.step_ratio, fea2denseAct=args.fea2denseAct)
+                    pos_pe=args.pos_pe, view_pe=args.view_pe, fea_pe=args.fea_pe, featureC=args.featureC, step_ratio=args.step_ratio, fea2denseAct=args.fea2denseAct,
+                    cfg=args)
 
 
     grad_vars = tensorf.get_optparam_groups(args.lr_init, args.lr_basis)
@@ -153,14 +201,22 @@ def reconstruction(args):
     #linear in logrithmic space
     N_voxel_list = (torch.round(torch.exp(torch.linspace(np.log(args.N_voxel_init), np.log(args.N_voxel_final), len(upsamp_list)+1))).long()).tolist()[1:]
 
-
     torch.cuda.empty_cache()
     PSNRs,PSNRs_test = [],[0]
 
     allrays, allrgbs = train_dataset.all_rays, train_dataset.all_rgbs
     if not args.ndc_ray:
         allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
-    trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
+
+    if args.text_guidance == 1:
+        # Rays are sampled in the order they were loaded from the dataset, so that rays will cohere into images.
+        trainingSampler = SequentialSampler(allrays.shape[0], args.batch_size)
+    else:
+        trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
+
+    # Attempt to iterate through all images in the dataset, saving them to disk
+
+
 
     Ortho_reg_weight = args.Ortho_weight
     print("initial Ortho_reg_weight", Ortho_reg_weight)
@@ -171,8 +227,25 @@ def reconstruction(args):
     tvreg = TVLoss()
     print(f"initial TV_weight density: {TV_weight_density} appearance: {TV_weight_app}")
 
+    if args.text_guidance == 1:
+        from models.sd import StableDiffusion
+        guidance = StableDiffusion(device)
+
+        for p in guidance.parameters():
+            p.requires_grad = False
+
+        text_z = prepare_text_embeddings(guidance, opt=args)
+
 
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout)
+
+    ##DEBUG
+    # img_eval_interval = 1
+    # ray_idxs = list(range(0, test_dataset.all_rays.shape[0], img_eval_interval))
+    # for ray_idx, samples in tqdm(enumerate(test_dataset.all_rays[0::img_eval_interval]), file=sys.stdout):
+    #     rays_train = samples.view(-1,samples.shape[-1])
+    ##DEBUG
+
     for iteration in pbar:
 
 
@@ -183,36 +256,66 @@ def reconstruction(args):
         rgb_map, alphas_map, depth_map, weights, uncertainty = renderer(rays_train, tensorf, chunk=args.batch_size,
                                 N_samples=nSamples, white_bg = white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
 
-        loss = torch.mean((rgb_map - rgb_train) ** 2)
+        rgb_map_64 = rgb_map.view(64, 64, 3)
+
+        # # Save this image
+        # img = rgb_map_64.cpu().detach().numpy()
+        # img = np.transpose(img, (1, 0, 2))
+        # img = (img * 255).astype(np.uint8)
+        # img = Image.fromarray(img)
+        # img.save('test.png')
+
+        # Save target image
+        img = rgb_train.view(64, 64, 3).cpu().detach().numpy()
+        img = np.transpose(img, (1, 0, 2))
+        img = (img * 255).astype(np.uint8)
+        img = Image.fromarray(img)
+        img.save('target.png')
+
+        if args.text_guidance == 1:
+            if args.dir_text:
+                TT()
+                dirs = data['dir']
+                text_z = text_z[dirs]
+
+            rgb_map_64 = rearrange(rgb_map_64, '(b h) w c -> b c h w', b=1)
+            optimizer.zero_grad()
+            loss = guidance.train_step(text_z, rgb_map_64)
+            optimizer.step()
+            # This is a dummy loss (we've already backpropagated it.)
+            loss = 0.0
+
+        else:
+            loss = torch.mean((rgb_map - rgb_train) ** 2)
 
 
-        # loss
-        total_loss = loss
-        if Ortho_reg_weight > 0:
-            loss_reg = tensorf.vector_comp_diffs()
-            total_loss += Ortho_reg_weight*loss_reg
-            summary_writer.add_scalar('train/reg', loss_reg.detach().item(), global_step=iteration)
-        if L1_reg_weight > 0:
-            loss_reg_L1 = tensorf.density_L1()
-            total_loss += L1_reg_weight*loss_reg_L1
-            summary_writer.add_scalar('train/reg_l1', loss_reg_L1.detach().item(), global_step=iteration)
+            # loss
+            total_loss = loss
+            if Ortho_reg_weight > 0:
+                loss_reg = tensorf.vector_comp_diffs()
+                total_loss += Ortho_reg_weight*loss_reg
+                summary_writer.add_scalar('train/reg', loss_reg.detach().item(), global_step=iteration)
+            if L1_reg_weight > 0:
+                loss_reg_L1 = tensorf.density_L1()
+                total_loss += L1_reg_weight*loss_reg_L1
+                summary_writer.add_scalar('train/reg_l1', loss_reg_L1.detach().item(), global_step=iteration)
 
-        if TV_weight_density>0:
-            TV_weight_density *= lr_factor
-            loss_tv = tensorf.TV_loss_density(tvreg) * TV_weight_density
-            total_loss = total_loss + loss_tv
-            summary_writer.add_scalar('train/reg_tv_density', loss_tv.detach().item(), global_step=iteration)
-        if TV_weight_app>0:
-            TV_weight_app *= lr_factor
-            loss_tv = tensorf.TV_loss_app(tvreg)*TV_weight_app
-            total_loss = total_loss + loss_tv
-            summary_writer.add_scalar('train/reg_tv_app', loss_tv.detach().item(), global_step=iteration)
+            if TV_weight_density>0:
+                TV_weight_density *= lr_factor
+                loss_tv = tensorf.TV_loss_density(tvreg) * TV_weight_density
+                total_loss = total_loss + loss_tv
+                summary_writer.add_scalar('train/reg_tv_density', loss_tv.detach().item(), global_step=iteration)
+            if TV_weight_app>0:
+                TV_weight_app *= lr_factor
+                loss_tv = tensorf.TV_loss_app(tvreg)*TV_weight_app
+                total_loss = total_loss + loss_tv
+                summary_writer.add_scalar('train/reg_tv_app', loss_tv.detach().item(), global_step=iteration)
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
 
-        loss = loss.detach().item()
+            loss = loss.detach().item()
         
         PSNRs.append(-10.0 * np.log(loss) / np.log(10.0))
         summary_writer.add_scalar('train/PSNR', PSNRs[-1], global_step=iteration)
@@ -254,7 +357,7 @@ def reconstruction(args):
 
             if not args.ndc_ray and iteration == update_AlphaMask_list[1]:
                 # filter rays outside the bbox
-                allrays,allrgbs = tensorf.filtering_rays(allrays,allrgbs)
+                allrays, allrgbs = tensorf.filtering_rays(allrays,allrgbs)
                 trainingSampler = SimpleSampler(allrgbs.shape[0], args.batch_size)
 
 
@@ -271,9 +374,14 @@ def reconstruction(args):
                 lr_scale = args.lr_decay_target_ratio ** (iteration / args.n_iters)
             grad_vars = tensorf.get_optparam_groups(args.lr_init*lr_scale, args.lr_basis*lr_scale)
             optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
+
+        
+        if iteration % args.save_every == args.save_every - 1 or iteration == args.n_iters - 1:
+            print("saving model")
+            tensorf.save(f'{logfolder}/model.th')
         
 
-    tensorf.save(f'{logfolder}/{args.expname}.th')
+    # tensorf.save(f'{logfolder}/{args.expname}.th')
 
 
     if args.render_train:
@@ -307,6 +415,10 @@ if __name__ == '__main__':
 
     args = config_parser()
     print(args)
+
+    if args.export_block_grid:
+        export_block_grid(args)
+        sys.exit()
 
     if  args.export_mesh:
         export_mesh(args)

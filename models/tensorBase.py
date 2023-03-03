@@ -1,3 +1,4 @@
+from pdb import set_trace as TT
 import torch
 import torch.nn
 import torch.nn.functional as F
@@ -140,7 +141,7 @@ class TensorBase(torch.nn.Module):
                     shadingMode = 'MLP_PE', alphaMask = None, near_far=[2.0,6.0],
                     density_shift = -10, alphaMask_thres=0.001, distance_scale=25, rayMarch_weight_thres=0.0001,
                     pos_pe = 6, view_pe = 6, fea_pe = 6, featureC=128, step_ratio=2.0,
-                    fea2denseAct = 'softplus'):
+                    fea2denseAct = 'softplus', **kwargs):
         super(TensorBase, self).__init__()
 
         self.density_n_comp = density_n_comp
@@ -264,6 +265,7 @@ class TensorBase(torch.nn.Module):
 
 
     def sample_ray_ndc(self, rays_o, rays_d, is_train=True, N_samples=-1):
+        TT()
         N_samples = N_samples if N_samples > 0 else self.nSamples
         near, far = self.near_far
         interpx = torch.linspace(near, far, N_samples).unsqueeze(0).to(rays_o)
@@ -370,7 +372,9 @@ class TensorBase(torch.nn.Module):
 
             mask_filtered.append(mask_inbbox.cpu())
 
+        # What is this `view` accomplishing?
         mask_filtered = torch.cat(mask_filtered).view(all_rgbs.shape[:-1])
+        # mask_filtered = torch.cat(mask_filtered)
 
         print(f'Ray filtering done! takes {time.time()-tt} s. ray mask ratio: {torch.sum(mask_filtered) / N}')
         return all_rays[mask_filtered], all_rgbs[mask_filtered]
@@ -396,7 +400,8 @@ class TensorBase(torch.nn.Module):
 
         if alpha_mask.any():
             xyz_sampled = self.normalize_coord(xyz_locs[alpha_mask])
-            sigma_feature = self.compute_densityfeature(xyz_sampled)
+            sigma_feature = self.compute_densityfeature(xyz_sampled, None)
+            # sigma_feature = self.compute_densityfeature(xyz_sampled)
             validsigma = self.feature2density(sigma_feature)
             sigma[alpha_mask] = validsigma
         
@@ -434,7 +439,8 @@ class TensorBase(torch.nn.Module):
 
         if ray_valid.any():
             xyz_sampled = self.normalize_coord(xyz_sampled)
-            sigma_feature = self.compute_densityfeature(xyz_sampled[ray_valid])
+            sigma_feature = self.compute_densityfeature(xyz_sampled, mask=ray_valid)
+            # sigma_feature = self.compute_densityfeature(xyz_sampled[ray_valid])
 
             validsigma = self.feature2density(sigma_feature)
             sigma[ray_valid] = validsigma
@@ -445,7 +451,8 @@ class TensorBase(torch.nn.Module):
         app_mask = weight > self.rayMarch_weight_thres
 
         if app_mask.any():
-            app_features = self.compute_appfeature(xyz_sampled[app_mask])
+            app_features = self.compute_appfeature(xyz_sampled, mask=app_mask)
+            # app_features = self.compute_appfeature(xyz_sampled[app_mask])
             valid_rgbs = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], app_features)
             rgb[app_mask] = valid_rgbs
 

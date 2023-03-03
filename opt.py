@@ -1,3 +1,4 @@
+import os
 import configargparse
 
 def config_parser(cmd=None):
@@ -20,7 +21,7 @@ def config_parser(cmd=None):
     parser.add_argument('--downsample_test', type=float, default=1.0)
 
     parser.add_argument('--model_name', type=str, default='TensorVMSplit',
-                        choices=['TensorVMSplit', 'TensorCP'])
+                        choices=['TensorVMSplit', 'TensorCP', 'TensorVMSplitBlocks'])
 
     # loader options
     parser.add_argument("--batch_size", type=int, default=4096)
@@ -54,6 +55,13 @@ def config_parser(cmd=None):
                         help='loss weight')
     parser.add_argument("--TV_weight_app", type=float, default=0.0,
                         help='loss weight')
+
+    # text guidance
+    parser.add_argument("--text_guidance", type=int, default=0,)
+    parser.add_argument('--text', default=None, help="text prompt")
+    parser.add_argument('--negative', default='', type=str, help="negative text prompt")
+    parser.add_argument('--dir_text', action='store_true', help="direction-encode the text prompt, by appending front/side/back/overhead view")
+    parser.add_argument('--negative_dir_text', action='store_true', help="also use negative dir text prompt.")
     
     # model
     # volume options
@@ -128,7 +136,46 @@ def config_parser(cmd=None):
                         help='N images to vis')
     parser.add_argument("--vis_every", type=int, default=10000,
                         help='frequency of visualize the image')
+
+    # Block NeRF options
+    parser.add_argument("--dummy_block_grid", type=int, default=0,)
+    parser.add_argument("--full_block_texture", type=int, default=0,)
+    parser.add_argument("--impose_block_density", type=int, default=0,)
+    parser.add_argument("--snap_to_block_surfaces", type=int, default=0,)
+    parser.add_argument("--export_block_grid", type=int, default=0,)
+
+    parser.add_argument("--save_every", type=int, default=10000,)
+
     if cmd is not None:
-        return parser.parse_args(cmd)
+        args = parser.parse_args(cmd)
     else:
-        return parser.parse_args()
+        args = parser.parse_args()
+
+    ### HACKS ###
+    args.expname = os.path.join(
+        args.expname, 
+        f"nVox-{args.N_voxel_final}",
+    )
+    # args.N_voxel_init = int(args.N_voxel_init)
+    if args.dummy_block_grid == 1:
+        args.vis_every = 1
+        args.n_iter=2
+        args.progress_refresh_rate=2
+        args.N_vis = 30
+
+    if args.model_name == 'TensorVMSplitBlocks':
+        args.N_voxel_final = args.N_voxel_init
+        args.expname = os.path.join(
+            args.expname,
+            f"dummyGrid-{args.dummy_block_grid}_fullTexture-{args.full_block_texture}_imposeDensity-{args.impose_block_density}_snapToSurfaces-{args.snap_to_block_surfaces}",
+        )
+
+    if args.export_block_grid or args.export_mesh:
+        args.ckpt = os.path.join(
+            "log",
+            args.expname,
+            "model.th",
+        )
+    ### END HACKS ###
+
+    return args

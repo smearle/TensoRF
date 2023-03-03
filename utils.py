@@ -219,3 +219,38 @@ def convert_sdf_samples_to_ply(
     ply_data = plyfile.PlyData([el_verts, el_faces])
     print("saving mesh to %s" % (ply_filename_out))
     ply_data.write(ply_filename_out)
+
+
+# calculate the text embs.
+def prepare_text_embeddings(guidance, opt):
+
+    if opt.text is None:
+        # self.log(f"[WARN] text prompt is not provided.")
+        print(f"[WARN] text prompt is not provided.")
+        text_z = None
+        return text_z
+
+    if not opt.dir_text:
+        text_z = guidance.get_text_embeds([opt.text], [opt.negative])
+    else:
+        text_z = []
+        for d in ['front', 'side', 'back', 'side', 'overhead', 'bottom']:
+            # construct dir-encoded text
+            text = f"{opt.text}, {d} view"
+
+            negative_text = f"{opt.negative}"
+
+            # explicit negative dir-encoded text
+            if opt.negative_dir_text:
+                if negative_text != '': negative_text += ', '
+
+                if d == 'back': negative_text += "front view"
+                elif d == 'front': negative_text += "back view"
+                elif d == 'side': negative_text += "front view, back view"
+                elif d == 'overhead': negative_text += "bottom view"
+                elif d == 'bottom': negative_text += "overhead view"
+            
+            text_z = guidance.get_text_embeds([text], [negative_text])
+            text_z.append(text_z)
+
+    return text_z

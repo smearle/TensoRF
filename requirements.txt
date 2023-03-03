@@ -1,0 +1,11 @@
+tqdm 
+scikit-image 
+opencv-python 
+configargparse 
+lpips 
+imageio-ffmpeg 
+kornia 
+lpips 
+tensorboard
+diffusers
+accelerate
